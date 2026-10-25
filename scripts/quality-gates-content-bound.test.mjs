@@ -211,6 +211,40 @@ test('#161: re-attempting the reviewed task invalidates the pass without needing
   )
 })
 
+test('#161 (tree-hash inheritance): a re-attempt that left the judged bytes identical keeps the pass', async () => {
+  const root = workspace()
+  try {
+    const recorded = readArtifacts(root, REVIEWED_PATHS)
+    const state = team({ reviewedAttempt: 1, reviewedArtifacts: recorded })
+    // A retried turn, a merge or a rebase moves the attempt counter but writes
+    // exactly the same bytes: the revision the reviewer judged is still current.
+    state.tasks[0].attempt = 2
+    state.tasks[0].attemptId = 'attempt-2'
+    writeFileSync(join(root, 'lib', 'stats.js'), STATS_V1)
+    const delivery = canDeclareDelivery(state, { artifacts: readArtifacts(root, REVIEWED_PATHS) })
+    assert.equal(delivery.ok, true, `identical bytes lost their verdict: ${JSON.stringify(delivery)}`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('#161 (tree-hash inheritance): a re-attempt that changed a judged byte still drifts', async () => {
+  const root = workspace()
+  try {
+    const recorded = readArtifacts(root, REVIEWED_PATHS)
+    const state = team({ reviewedAttempt: 1, reviewedArtifacts: recorded })
+    state.tasks[0].attempt = 2
+    state.tasks[0].attemptId = 'attempt-2'
+    await pause(10)
+    writeFileSync(join(root, 'lib', 'stats.js'), STATS_V2)
+    const delivery = canDeclareDelivery(state, { artifacts: readArtifacts(root, REVIEWED_PATHS) })
+    assert.equal(delivery.ok, false, `changed bytes kept a stale pass: ${JSON.stringify(delivery)}`)
+    assert.ok(delivery.blockers.some((item) => item.includes('lib/stats.js')), `no byte blocker: ${JSON.stringify(delivery.blockers)}`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('#161: an intermediate verification that drifted is surfaced without false-blocking the newer review', async () => {
   const root = workspace()
   try {

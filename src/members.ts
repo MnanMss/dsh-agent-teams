@@ -197,17 +197,55 @@ export function selectFallbackRoute(
   return { retry: true, switched: true, selection: fallback }
 }
 
+/**
+ * How a durable report should reach the captain. Steering only wakes an idle
+ * driver when its step is accepted: a rejected step leaves the message parked
+ * until some later wake, which is how a failed member turn used to sit unread
+ * for hours. An idle captain therefore gets its own follow-up turn; a running
+ * one still takes the report at its next step boundary.
+ */
+export function captainReportChannel(status: Agent['status'] | undefined): 'followup' | 'steer' {
+  return status === 'running' ? 'steer' : 'followup'
+}
+
 /** Deliver a durable member report to the live captain at its next model step. */
-export function steerCaptainReport(captain: Pick<Agent, 'steer'> & SessionFormatBearer, from: string, content: string, receipt?: string): boolean {
+export function steerCaptainReport(
+  captain: Pick<Agent, 'steer'> & Partial<Pick<Agent, 'followup' | 'status' | 'inbox' | 'whenIdle'>> & SessionFormatBearer,
+  from: string,
+  content: string,
+  receipt?: string,
+): boolean {
+  const message = createUserMessage({
+    content: [{ type: 'text', text: receipt ?? `AgentTeams message from member ${from}:\n\n${content}` }],
+    source: agentTeamsSource({ kind: 'agent-teams' }, observedSessionFormatVersion(captain)),
+  })
+  const followup = captain.followup?.bind(captain)
+  const channel = captainReportChannel(captain.status)
   try {
-    captain.steer(createUserMessage({
-      content: [{ type: 'text', text: receipt ?? `AgentTeams message from member ${from}:\n\n${content}` }],
-      source: agentTeamsSource({ kind: 'agent-teams' }, observedSessionFormatVersion(captain)),
-    }))
-    return true
+    if (channel === 'followup' && followup !== undefined) {
+      followup(message)
+      return true
+    }
+    captain.steer(message)
   } catch {
     return false
   }
+  // Steering was accepted but may still be parked if the captain's step is
+  // rejected: once the activity settles, hand any unclaimed copy to a
+  // follow-up turn instead of waiting for an unrelated user message.
+  const inbox = captain.inbox
+  if (followup !== undefined && inbox !== undefined && typeof captain.whenIdle === 'function') {
+    void captain.whenIdle().then(() => {
+      const parked = [...inbox.nextStep, ...inbox.nextTurn].some((item) => item.id === message.id)
+      if (!parked) return
+      try {
+        followup(message)
+      } catch {
+        // The durable mailbox copy still holds the report; nothing to recover.
+      }
+    }).catch(() => {})
+  }
+  return true
 }
 
 interface FailedMemberAttempt {

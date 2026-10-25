@@ -57,3 +57,68 @@ await test('a captain report through a real call site uses the live header', () 
   assert.equal(steered.length, 1)
   assert.deepEqual(steered[0].source, modern)
 })
+
+// A failed member turn is delivered while the captain may be idle. Steering
+// then parks the message until some later wake (a user message), which is how
+// a failed task's report sat unread for hours. An idle captain must instead get
+// its own follow-up turn; a running one still takes the report at its next step.
+await test('an idle captain receives a member report as its own follow-up turn', () => {
+  const steered = []
+  const followed = []
+  const idle = {
+    session: { header: { version: 4 } },
+    status: 'idle',
+    steer(message) { steered.push(message) },
+    followup(message) { followed.push(message) },
+  }
+  assert.equal(steerCaptainReport(idle, 'member-1', 'task t3 failed'), true)
+  assert.equal(steered.length, 0, 'steering an idle captain parks the report')
+  assert.equal(followed.length, 1)
+  assert.deepEqual(followed[0].source, modern)
+})
+
+await test('a running captain still takes the report at its next step', () => {
+  const steered = []
+  const followed = []
+  const running = {
+    session: { header: { version: 4 } },
+    status: 'running',
+    steer(message) { steered.push(message) },
+    followup(message) { followed.push(message) },
+  }
+  assert.equal(steerCaptainReport(running, 'member-1', 'progress'), true)
+  assert.equal(steered.length, 1)
+  assert.equal(followed.length, 0)
+})
+
+await test('a steering message the captain never claimed is re-delivered as a follow-up', async () => {
+  const steered = []
+  const followed = []
+  const running = {
+    session: { header: { version: 4 } },
+    status: 'running',
+    steer(message) { steered.push(message) },
+    followup(message) { followed.push(message) },
+    inbox: { get nextStep() { return steered }, nextTurn: [] },
+    whenIdle: async () => {},
+  }
+  assert.equal(steerCaptainReport(running, 'member-1', 'task t3 failed'), true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(followed.length, 1, 'a parked report must not wait for an unrelated user message')
+  assert.equal(followed[0].id, steered[0].id)
+})
+
+await test('a claimed steering message is not delivered twice', async () => {
+  const followed = []
+  const running = {
+    session: { header: { version: 4 } },
+    status: 'running',
+    steer() {},
+    followup(message) { followed.push(message) },
+    inbox: { nextStep: [], nextTurn: [] },
+    whenIdle: async () => {},
+  }
+  assert.equal(steerCaptainReport(running, 'member-1', 'progress'), true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(followed.length, 0)
+})

@@ -134,8 +134,16 @@ export declare function selectFallbackRoute(current: {
         model: string;
     };
 };
+/**
+ * How a durable report should reach the captain. Steering only wakes an idle
+ * driver when its step is accepted: a rejected step leaves the message parked
+ * until some later wake, which is how a failed member turn used to sit unread
+ * for hours. An idle captain therefore gets its own follow-up turn; a running
+ * one still takes the report at its next step boundary.
+ */
+export declare function captainReportChannel(status: Agent['status'] | undefined): 'followup' | 'steer';
 /** Deliver a durable member report to the live captain at its next model step. */
-export declare function steerCaptainReport(captain: Pick<Agent, 'steer'> & SessionFormatBearer, from: string, content: string, receipt?: string): boolean;
+export declare function steerCaptainReport(captain: Pick<Agent, 'steer'> & Partial<Pick<Agent, 'followup' | 'status' | 'inbox' | 'whenIdle'>> & SessionFormatBearer, from: string, content: string, receipt?: string): boolean;
 interface FailedMemberAttempt {
     readonly captainSessionId: string;
     readonly memberId: string;

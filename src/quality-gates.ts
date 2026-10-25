@@ -1342,9 +1342,8 @@ const MTIME_TOLERANCE_MS = 1
 function verdictDrift(team: TeamState, item: TeamTask, audit: DeliveryAudit): ArtifactDriftDetail[] {
   const issues: ArtifactDriftDetail[] = []
   const target = reviewedTargetOf(team, item)
-  if (target !== undefined && item.reviewedAttempt !== undefined && (target.attempt ?? 0) !== item.reviewedAttempt) {
-    issues.push({ message: `${target.id} was re-attempted after this verdict (attempt ${item.reviewedAttempt} -> ${target.attempt ?? 0})` })
-  }
+  const attemptMoved = target !== undefined && item.reviewedAttempt !== undefined && (target.attempt ?? 0) !== item.reviewedAttempt
+  const attemptDrift = target === undefined ? '' : `${target.id} was re-attempted after this verdict (attempt ${item.reviewedAttempt} -> ${target.attempt ?? 0})`
   for (const gap of gapDrift(item.reviewedGaps)) issues.push({ message: gap })
   for (const drift of item.reviewedDuringDrift ?? []) {
     issues.push({ message: `the workspace changed while this verdict was being formed (${drift}), so it does not bind a stable revision` })
@@ -1362,9 +1361,19 @@ function verdictDrift(team: TeamState, item: TeamTask, audit: DeliveryAudit): Ar
     }
   }
   if (recorded !== undefined && recorded.length > 0) {
-    issues.push(...artifactDriftDetails(recorded, audit.artifacts))
+    // The attempt counter is bookkeeping, not content: a re-attempt that left
+    // every judged byte identical judged the same revision, so only a real
+    // byte change invalidates the pass. A merge, a rebase or a retried turn
+    // that did not touch the reviewed paths must not force a second review.
+    const drift = artifactDriftDetails(recorded, audit.artifacts)
+    if (drift.length > 0) {
+      if (attemptMoved) issues.push({ message: `${attemptDrift}, and the bytes it judged changed` })
+      issues.push(...drift)
+    }
     return issues
   }
+  // Without a recorded identity the attempt counter is the only signal left.
+  if (attemptMoved) issues.push({ message: attemptDrift })
   // A record written before content-bound verdicts existed carries no digests,
   // but the revision it judged is still identifiable: the bytes the target
   // claimed to change cannot have been written after the verdict closed.
@@ -1489,15 +1498,15 @@ export function verdictAuditNotes(team: TeamState, audit: DeliveryAudit = {}): V
 
 /**
  * Does this verdict hold a real, complete, still-matching record of the bytes
- * it judged? Attempt drift, an incomplete scope, or a workspace that moved
- * while the gate was open all disqualify it.
+ * it judged? An incomplete scope, a workspace that moved while the gate was
+ * open, or any byte change disqualifies it. A moved attempt counter does not:
+ * the recorded digests already answer whether the bytes are the ones judged,
+ * and a retried or merged attempt that changed nothing keeps the same revision.
  */
 function bindsRecordedRevision(team: TeamState, item: TeamTask, audit: DeliveryAudit): boolean {
   if ((item.reviewedArtifacts?.length ?? 0) === 0) return false
   if ((item.reviewedGaps?.length ?? 0) > 0) return false
   if ((item.reviewedDuringDrift?.length ?? 0) > 0) return false
-  const target = reviewedTargetOf(team, item)
-  if (target !== undefined && item.reviewedAttempt !== undefined && (target.attempt ?? 0) !== item.reviewedAttempt) return false
   if (audit.artifacts === undefined) return false
   return artifactDriftDetails(item.reviewedArtifacts, audit.artifacts).length === 0
 }
