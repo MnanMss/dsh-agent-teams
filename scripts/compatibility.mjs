@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 export const policy = JSON.parse(readFileSync(new URL('../compatibility.json', import.meta.url), 'utf8'))
@@ -38,6 +38,16 @@ export function validatePolicy(input) {
       throw new Error('Host targets must be unique exact versions with an explicit track')
     }
     versions.add(host.version)
+    if (host.platforms !== undefined && (!Array.isArray(host.platforms)
+        || !host.platforms.includes('ubuntu-latest')
+        || new Set(host.platforms).size !== host.platforms.length
+        || host.platforms.some(platform => !['ubuntu-latest', 'windows-latest'].includes(platform)))) {
+      throw new Error('Host platforms must include Ubuntu and only unique supported CI platforms')
+    }
+    if (host.legacyDirectInstallReason !== undefined && (typeof host.legacyDirectInstallReason !== 'string'
+        || !host.legacyDirectInstallReason.trim())) {
+      throw new Error('Legacy direct-install coverage requires an explicit reason')
+    }
   }
   const recommended = hosts.filter(host => host.track === 'recommended')
   if (recommended.length !== 1 || recommended[0].version !== input.recommendedHost) throw new Error('Exactly one recommended host is required')
@@ -61,6 +71,21 @@ export function validatePolicy(input) {
 
 export function declaredHostVersions(input = policy) {
   return [...validatePolicy(input), ...(input.sourceCandidates ?? []).map(candidate => candidate.version)]
+}
+
+/** Explicit maintenance operation: derive peer metadata, never discover or approve hosts. */
+export function generateHostPeers(pkg, input = policy, workspace = workspacePolicy) {
+  const generated = structuredClone(pkg)
+  const range = declaredHostVersions(input).join(' || ')
+  // A deleted import declaration is a different defect; do not hide it during synchronization.
+  for (const name of requiredHostPeers) {
+    if (typeof generated.peerDependencies?.[name] !== 'string') throw new Error(`Missing required host peer declaration: ${name}`)
+  }
+  for (const name of Object.keys(generated.peerDependencies)) {
+    if (name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-')) generated.peerDependencies[name] = range
+  }
+  validatePackageCompatibility(generated, input, workspace)
+  return generated
 }
 
 export function validatePackageCompatibility(pkg, input = policy, workspace = workspacePolicy) {
@@ -100,13 +125,29 @@ export function validatePackageCompatibility(pkg, input = policy, workspace = wo
       }
     }
   }
+  // The official installer gives this field precedence over every peer range.
+  // A broad engines.dsh must not silently bypass our exact support declaration.
+  if (Object.hasOwn(pkg.engines ?? {}, 'dsh')) {
+    const declared = typeof pkg.engines.dsh === 'string' ? pkg.engines.dsh.split('||').map(value => value.trim()) : []
+    if (declared.length !== declaredVersions.length || declaredVersions.some(version => !declared.includes(version))) {
+      throw new Error('engines.dsh must enumerate the same exact declared host targets')
+    }
+  }
   return versions
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  if (process.argv.length === 3 && process.argv[2] === '--write-peers') {
+    const generated = generateHostPeers(pkg)
+    if (JSON.stringify(generated) !== JSON.stringify(pkg)) {
+      writeFileSync(new URL('../package.json', import.meta.url), JSON.stringify(generated, null, 2) + '\n')
+    }
+    console.log('Generated exact host peer ranges from compatibility.json; supported targets unchanged.')
+    process.exit(0)
+  }
   const hosts = validatePackageCompatibility(pkg)
   if (process.argv[2] === '--github-output') console.log(`hosts=${JSON.stringify(hosts)}`)
   else if (process.argv.length === 2) console.log(`Compatibility targets: ${hosts.join(', ')}`)
-  else throw new Error('Usage: node scripts/compatibility.mjs [--github-output]')
+  else throw new Error('Usage: node scripts/compatibility.mjs [--github-output | --write-peers]')
 }

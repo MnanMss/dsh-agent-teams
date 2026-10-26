@@ -36,7 +36,7 @@ Ask in natural language. The plugin provides the team protocol, 14 coordination 
 
 ## Releases
 
-[v0.1.26](./release-notes/v0.1.26.md) refreshes the team workspace with completion and inbox cards, preserves the distinct claimed state, and fixes optional tool inputs and live host session-format detection. This stable plugin release uses npm `latest`; the recommended Harness host remains `0.2.1-rc.2`. See the exact [support matrix](./compatibility.json) and [verification scope](./docs/maintenance-workflow.md).
+[Latest release](https://github.com/NanmiCoder/dsh-agent-teams/releases/latest) adds Harness `0.2.1-rc.3` support, fixes Windows packaging and runtime verification, and prevents missing installation checks when adding future hosts. npm installs use `latest`; Git installs use the default branch. The recommended Harness host remains `0.2.1-rc.2`. See the exact [support matrix](./compatibility.json) and [release notes](./release-notes/v0.1.27.md).
 
 ## Why AgentTeams?
 
@@ -55,49 +55,64 @@ The conversation card and activity panel use Harness's official locale service. 
 
 ## Install and choose versions
 
-**Recommended pair: DeepSeek Harness `0.2.1-rc.2` + AgentTeams `0.1.26`. The host remains an RC.**
+**Recommended pair: DeepSeek Harness `0.2.1-rc.2` + AgentTeams `0.1.27`. The host remains an RC.**
 
 | Use case | DeepSeek Harness | AgentTeams plugin |
 | --- | --- | --- |
-| **Recommended** | **`0.2.1-rc.2`** | **`0.1.26`** |
-| Previous recommended RC | `0.2.1-rc.1`, `0.2.0-rc.2`, `0.1.7-rc.2` | `0.1.26` |
-| Legacy RC | `0.1.5-rc.1`, `0.1.5-rc.2`, `0.1.5-rc.3` | `0.1.26` |
-| Retaining an older RC | `0.1.2-rc.1` | `0.1.26` |
-| Developer Alpha testing | `0.1.2-alpha.5` | `0.1.26` |
-| Retaining an older Alpha | `0.1.2-alpha.2` | `0.1.26` |
+| **Recommended** | **`0.2.1-rc.2`** | **`0.1.27`** |
+| Preview host | `0.2.1-rc.3` | `0.1.27` |
+| Previous recommended RC | `0.2.1-rc.1`, `0.2.0-rc.2`, `0.1.7-rc.2` | `0.1.27` |
+| Legacy RC | `0.1.5-rc.1`, `0.1.5-rc.2`, `0.1.5-rc.3` | `0.1.27` |
+| Retaining an older RC | `0.1.2-rc.1` | `0.1.27` |
+| Developer Alpha testing | `0.1.2-alpha.5` | `0.1.27` |
+| Retaining an older Alpha | `0.1.2-alpha.2` | `0.1.27` |
 
 ### Desktop app
 
-In the app sidebar, open **Plugins → Add plugin** and enter the npm package spec:
+In the app sidebar, open **Plugins → Add plugin**. You can install directly from GitHub by pasting this repository URL into the plugin input, without a version, tag, or commit suffix:
 
 ```text
-@nanmicoder/dsh-agent-teams
+https://github.com/NanmiCoder/dsh-agent-teams
 ```
 
-The package name resolves npm `latest`. To pin a version, append `@0.1.26`. Install it, then choose **Enable now**. If the host asks for a restart, restart the desktop app. Use the package spec above for the published build; an npm or GitHub webpage URL is not the same install source. For Git installation, use a commit containing the verified build outputs described below.
+This installs from the default branch and is available immediately after release. The equivalent shorthand is also supported:
+
+```text
+github:NanmiCoder/dsh-agent-teams
+```
+
+For npm installation, enter `@nanmicoder/dsh-agent-teams@latest`. Desktop's pnpm 11 defaults to a 24-hour minimum release age: during that window it can select an older plugin even when the preview shows the newest version. If that older plugin is incompatible with your host, use the GitHub spec above or wait until the release has aged. Changing registry mirrors does not remove this policy. GitHub access is required for the Git route; it may contain newer code than npm.
+
+Install it, then choose **Enable now**. If the host asks for a restart, restart the desktop app. Do not disable compatibility checks or the global release-age policy to install the plugin.
 
 The desktop app supplies its own Harness core and package manager. Upgrading the global CLI does not upgrade that core, and an ordinary standalone CLI cannot manage its desktop profile. The CLI carrier installed by the desktop app can manage that profile in `0.2.1-rc.2`. Check the embedded core against the compatibility list. Harness `0.2.1-rc.2` is now the exact published target; its RC status is unchanged. The earlier source-only `0.2.0` prediction is no longer a support declaration. See the [release migration evidence](./docs/harness-0.2.1-rc.2/README.md).
 
 ### CLI / Web: 1. Install DeepSeek Harness
 
 ```sh
-npm install --global @deepseek-ai/dsh@0.2.1-rc.2
+npm install --global @deepseek-ai/dsh
 dsh --version
 ```
 
-Skip this if you already run this version. Alpha is opt-in: select an exact Alpha version from the table and lock all host dependencies as described in the [maintenance guide](./docs/maintenance-workflow.md).
+The command selects the host's npm `latest`; check `dsh --version` against the support matrix after upgrading. Alpha is opt-in: select an exact Alpha version from the table and lock all host dependencies as described in the [maintenance guide](./docs/maintenance-workflow.md).
 
 ### CLI / Web: 2. Install the AgentTeams plugin
 
-Install or upgrade from npm using the package name (resolves npm `latest`, currently `0.1.26`):
+Install or upgrade from npm using the package name (resolves npm `latest`, currently `0.1.27`):
 
 ```sh
-dsh plugin --profile web add --save-exact @nanmicoder/dsh-agent-teams
+dsh plugin --profile web add --save-exact @nanmicoder/dsh-agent-teams@latest
 ```
 
 For a CLI-managed installation, replace `web` with your active CLI profile. **Stop and restart that profile's Harness process, then refresh the browser.** Installing the plugin does not upgrade Harness; the host and plugin have independent `latest` channels.
 
-For Git installation, use a Git package spec pinned to a commit containing the verified server, client, and type build outputs in `lib/`, rather than an npm webpage URL. The repository distributes these outputs so installation does not need a `prepare` hook or build-script approval. Source maintainers must run `pnpm build` and update the committed outputs whenever the source changes. Existing npm releases remain immutable.
+Alternatively, install or update from the latest GitHub default branch without a tag or commit suffix:
+
+```sh
+dsh plugin --profile web add github:NanmiCoder/dsh-agent-teams
+```
+
+The `@latest` channel explicitly requests the newest published plugin when updating an existing installation; it is not a numeric version pin. A bare package name can retain an already installed exact version. Run the chosen install command again when updating, then restart the profile. If a registry mirror has not synced the release, append `--registry=https://registry.npmjs.org` to the npm command. GitHub default-branch code may be newer than npm `latest`. The default branch includes the verified server, client, and type build outputs in `lib/`. The repository distributes these outputs so installation does not need a `prepare` hook or build-script approval. Source maintainers must run `pnpm build` and update the committed outputs whenever the source changes. Existing npm releases remain immutable.
 
 For a manually cloned checkout, run `pnpm install --frozen-lockfile` and `pnpm build` after pulling, then restart the corresponding Harness process. Updating Git alone does not update local build output. See the [maintenance guide](./docs/maintenance-workflow.md).
 

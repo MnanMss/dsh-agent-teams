@@ -6,7 +6,43 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { inspectInstallation } from './doctor.mjs'
-import { policy, workspacePolicy, requiredHostPeers, validatePolicy, validatePackageCompatibility, declaredHostVersions } from './compatibility.mjs'
+import { policy, workspacePolicy, requiredHostPeers, validatePolicy, validatePackageCompatibility, declaredHostVersions, generateHostPeers } from './compatibility.mjs'
+
+test('one audited policy change generates all peers without altering support or other package behavior', () => {
+  const original = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const future = { ...structuredClone(policy), supportedHosts: [{ version: '0.2.1-rc.999', track: 'preview' }, ...policy.supportedHosts] }
+  const saved = structuredClone(future)
+  // Before synchronization the real gate rejects the partial maintenance edit.
+  assert.throws(() => validatePackageCompatibility(original, future), /peer range/)
+  const generated = generateHostPeers(original, future)
+  assert.doesNotThrow(() => validatePackageCompatibility(generated, future))
+  assert.deepEqual(future, saved, 'Generating metadata must not approve or modify targets')
+  assert.deepEqual(generateHostPeers(generated, future), generated, 'Idempotent generation')
+  const changed = Object.keys(original.peerDependencies).filter(name => original.peerDependencies[name] !== generated.peerDependencies[name])
+  assert.equal(changed.length, 21)
+  for (const name of changed) {
+    assert.ok(generated.peerDependencies[name].split(' || ').includes('0.2.1-rc.999'))
+    assert.ok(!generated.peerDependencies[name].split(' || ').includes('0.2.1-rc.1000'), 'Unknown host stays rejected')
+  }
+  const restored = { ...generated, peerDependencies: original.peerDependencies }
+  assert.deepEqual(restored, original, 'No dependency baseline, scripts, metadata or other peer changes')
+  const missing = structuredClone(original)
+  delete missing.peerDependencies['@deepseek-ai/dsh-agent']
+  assert.throws(() => generateHostPeers(missing, future), /Missing required/)
+  const mixed = structuredClone(original)
+  mixed.devDependencies['@deepseek-ai/dsh-agent'] = '0.1.2-alpha.2'
+  assert.throws(() => generateHostPeers(mixed, future), /exact development host/)
+})
+
+test('engines.dsh cannot override the exact peer gate with a wider or contradictory range', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  for (const dsh of ['*', '>=0.1.0', policy.recommendedHost, null]) {
+    const overridden = { ...pkg, engines: { ...pkg.engines, dsh } }
+    assert.throws(() => validatePackageCompatibility(overridden), /engines.dsh/)
+    assert.throws(() => generateHostPeers(overridden), /engines.dsh/)
+  }
+  assert.doesNotThrow(() => validatePackageCompatibility({ ...pkg, engines: { ...pkg.engines, dsh: declaredHostVersions().join(' || ') } }))
+})
 
 const sourcePolicy = { ...policy, sourceCandidates: [{ version: '0.2.0', repository: 'https://github.com/deepseek-ai/deepseek-harness', commit: '21638c56315ae6a2b552d6091945d3144c9af32e', evidence: 'docs/harness-0.2.0-pre-adaptation/README.md' }] }
 
@@ -181,6 +217,7 @@ test('doctor detects peer-only drift and a mismatched installed plugin', t => {
 
 test('released target enters the download matrix and replaces the old source prediction', () => {
   assert.equal(policy.recommendedHost, '0.2.1-rc.2')
+  assert.ok(validatePolicy(policy).includes('0.2.1-rc.3'))
   assert.ok(validatePolicy(policy).includes('0.2.1-rc.2'))
   assert.ok(validatePolicy(policy).includes('0.2.1-rc.1'))
   assert.ok(validatePolicy(policy).includes('0.2.0-rc.2'))
