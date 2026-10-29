@@ -37,7 +37,7 @@ import { installAgentTeamsGestureBoundary, registerAgentTeamsCommand } from './c
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { collectArchivedTeamsActivity, collectTeamsActivity } from './snapshot.ts'
+import { collectArchivedTeamsActivity, collectTeamsActivity, resolveSnapshotRoots } from './snapshot.ts'
 import { findTeamByCaptain } from './state.ts'
 import { leadIdentityOfAsync } from './lineage.ts'
 import { formatProfilesForPrompt, type TeamProfileConfig } from './profiles.ts'
@@ -262,13 +262,11 @@ export function apply(ctx: Context, config: Config): void {
     path: '/plugins/dsh-agent-teams/state',
     handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://x')
-      const roots = workspaceRegistry.list().map((workspace) => ({
-        workspace: workspace.title,
-        // The panel audits the same current bytes as agent_teams_status, so it
-        // cannot advertise a passing gate over a changed revision (#161).
-        workspacePath: workspace.path,
-        stateRoot: join(workspace.path, resolved.stateDir),
-      }))
+      // The registry alone misses the teams of a session opened on a git
+      // worktree: its state lives under its own cwd, which is never registered.
+      // `resolveSnapshotRoots` also reads the live session cwds, so the panel
+      // audits the same root the halt/plan routes already use.
+      const roots = await resolveSnapshotRoots(ctx, workspaceRegistry.list(), resolved.stateDir)
       // ?archived=1 serves teams moved to archive/ (post-delete review).
       const snapshots = url.searchParams.get('archived') === '1'
         ? await collectArchivedTeamsActivity(ctx, roots)

@@ -9,8 +9,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readdir, realpath } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import { memberActivity } from './members.ts'
 import { canDeclareDelivery, describeQualityLoop, verdictAuditNotes } from './quality-gates.ts'
 import { auditTeamWorkspace } from './workspace-audit.ts'
@@ -102,6 +102,199 @@ export interface TeamSnapshotOptions {
    * the model-facing status tool cannot report different delivery verdicts.
    */
   readonly workspacePath?: string
+}
+
+/** One state root the activity panel audits, with its display name. */
+export interface SnapshotRoot {
+  /** Display name: the workspace title, or the working directory's final segment. */
+  readonly workspace: string
+  /** Absolute directory holding one `<teamId>/` subdirectory per team. */
+  readonly stateRoot: string
+  /** Directory whose bytes the snapshot audits (the owning workspace path). */
+  readonly workspacePath: string
+}
+
+/** Upper bound for one `realpath` lookup on the panel's one-second poll. */
+const REALPATH_TIMEOUT_MS = 75
+
+/** How long a timed-out lookup keeps its raw spelling before it is retried. */
+const REALPATH_TIMEOUT_COOLDOWN_MS = 30_000
+
+/**
+ * Paths whose lookup timed out, and when they may be looked up again.
+ *
+ * `realpath` cannot be cancelled: after the race gives up, the syscall keeps a
+ * libuv thread until it returns. Re-issuing one every poll on a dead network
+ * mount would drain the shared thread pool and stall unrelated filesystem work
+ * in the host, so a timed-out path waits out the cooldown instead.
+ */
+const timedOutPaths = new Map<string, number>()
+
+/** Options for {@link canonicalDirectory}. */
+export interface CanonicalDirectoryOptions {
+  /** How long one lookup may take; defaults to {@link REALPATH_TIMEOUT_MS}. */
+  readonly timeoutMs?: number
+  /** Lookup implementation; defaults to `fs.realpath` (a seam for tests). */
+  readonly lookup?: (path: string) => Promise<string>
+}
+
+/** Remember one timed-out path, keeping the map bounded. */
+function rememberTimeout(path: string): void {
+  if (timedOutPaths.size >= 64) timedOutPaths.clear()
+  timedOutPaths.set(path, Date.now() + REALPATH_TIMEOUT_COOLDOWN_MS)
+}
+
+/**
+ * Canonical spelling of one directory.
+ *
+ * The workspace registry stores `fs.realpath`-normalized paths, so a directory
+ * spelled differently elsewhere (`/tmp/x` vs `/private/tmp/x`) would otherwise
+ * contribute a second root for one state directory and return every team
+ * snapshot twice. A path that no longer resolves keeps its raw spelling: a
+ * vanished directory must not silently drop a session whose team files are
+ * still on disk.
+ *
+ * The lookup is bounded because it runs on every poll: a session cwd on a dead
+ * network mount must cost one slow request, not a frozen panel.
+ * @param path - directory to canonicalize.
+ * @param options - lookup timeout and an optional lookup implementation.
+ * @returns the canonical path, or the raw spelling when it does not resolve.
+ */
+export async function canonicalDirectory(
+  path: string,
+  options: CanonicalDirectoryOptions = {},
+): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? REALPATH_TIMEOUT_MS
+  const lookup = options.lookup ?? realpath
+  const retryAt = timedOutPaths.get(path)
+  if (retryAt !== undefined) {
+    if (retryAt > Date.now()) return path
+    timedOutPaths.delete(path)
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      lookup(path),
+      new Promise<string>((_resolve, reject) => {
+        const timeout = new Error(`realpath timed out after ${timeoutMs}ms`)
+        timeout.name = 'TimeoutError'
+        timer = setTimeout(() => reject(timeout), timeoutMs)
+        timer.unref()
+      }),
+    ])
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === 'TimeoutError') rememberTimeout(path)
+    return path
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/** True when a filesystem error only means the directory is not there. */
+function isMissingDirectory(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
+
+/**
+ * Every state root the Web surface must audit: registered workspaces plus the
+ * working directory of every live session.
+ *
+ * A session opened on a git worktree — or on any directory the user never
+ * registered as a Workspace — keeps its teams under its own `<cwd>/<stateDir>`.
+ * A registry-only scan therefore hides exactly the teams created there, and the
+ * Web panel renders empty for that session while `halt`/`plan` keep working
+ * (they derive the root from `captain.session.header.cwd`). Auditing the live
+ * session cwds keeps the panel on the same root as those routes, including
+ * their `?? process.cwd()` fallback for a session without a recorded cwd.
+ * @param workspaces - registered workspaces, in registry order.
+ * @param sessionCwds - working directories of live sessions; a raw spelling is
+ * fine, because the dedupe key is the resolved state root.
+ * @param stateDir - configured state directory name.
+ * @returns one root per distinct state root, registry order first.
+ */
+export async function snapshotRoots(
+  workspaces: readonly { readonly path: string; readonly title: string }[],
+  sessionCwds: readonly string[],
+  stateDir: string,
+): Promise<SnapshotRoot[]> {
+  const candidates: { workspace: string; directory: string }[] = []
+  for (const workspace of workspaces) candidates.push({ workspace: workspace.title, directory: workspace.path })
+  for (const cwd of sessionCwds) {
+    if (cwd === '') continue
+    // `basename('/')` is empty: keep the path so the panel never shows an
+    // unnamed workspace.
+    candidates.push({ workspace: basename(cwd) || cwd, directory: cwd })
+  }
+  const resolved = await Promise.all(candidates.map(async (candidate) => ({
+    ...candidate,
+    stateRoot: await canonicalDirectory(join(candidate.directory, stateDir)),
+  })))
+  const roots = new Map<string, SnapshotRoot>()
+  for (const root of resolved) {
+    // Dedupe on the resolved state root, not on the directory spelling: two
+    // directories can share one state root through a symlinked `.agent-teams`,
+    // or through a stateDir that escapes with `..`. A shared state root would
+    // otherwise return every team in it twice, and the panel would render two
+    // cards under one React key.
+    if (roots.has(root.stateRoot)) continue
+    roots.set(root.stateRoot, {
+      workspace: root.workspace,
+      stateRoot: root.stateRoot,
+      // First candidate wins: when two directories share one state root, their
+      // state files are the same bytes, so auditing them through either path
+      // reads the same content.
+      workspacePath: root.directory,
+    })
+  }
+  return [...roots.values()]
+}
+
+/**
+ * Resolve `snapshotRoots` against the live runtime: registered workspaces plus
+ * every live session's working directory.
+ *
+ * Kept as one function so the state route cannot drift from the writers'
+ * `header.cwd ?? process.cwd()` rule without a test failing.
+ *
+ * Session cwds are canonicalized first: while a directory has no state dir yet,
+ * `realpath` on the state root fails and two spellings of one directory would
+ * each keep their raw string, defeating the dedupe.
+ * @param ctx - the plugin context (reads `ctx.agents.list()`).
+ * @param workspaces - registered workspaces, in registry order.
+ * @param stateDir - configured state directory name.
+ * @returns one root per distinct state root, registry order first. A failing
+ * agent registry degrades to the registered workspaces instead of throwing.
+ */
+export async function resolveSnapshotRoots(
+  ctx: Context,
+  workspaces: readonly { readonly path: string; readonly title: string }[],
+  stateDir: string,
+): Promise<SnapshotRoot[]> {
+  let sessionCwds: string[]
+  try {
+    sessionCwds = await Promise.all(ctx.agents.list().map(async (agent) => {
+      let cwd: string | undefined
+      try {
+        cwd = agent.session.header.cwd
+      } catch (error: unknown) {
+        // One unreadable header must not drop every other worktree root: that
+        // is the very symptom this route was fixed for. `snapshotRoots` skips
+        // the empty spelling.
+        ctx.logger.warn(`agent-teams: skipped a session without a readable cwd: ${String(error)}`)
+        return ''
+      }
+      // Writers use `header.cwd ?? process.cwd()`, and an empty cwd writes a
+      // relative state dir that also lands in process.cwd(): mirror both
+      // spellings so the panel never skips a team the writers created.
+      return await canonicalDirectory(cwd === undefined || cwd === '' ? process.cwd() : cwd)
+    }))
+  } catch (error: unknown) {
+    // Before this fix the route never touched `ctx.agents`, so a registry that
+    // is not ready yet must not turn every panel into a failed request.
+    ctx.logger.warn(`agent-teams: live session scan failed, reading registered workspaces only: ${String(error)}`)
+    return await snapshotRoots(workspaces, [], stateDir)
+  }
+  return await snapshotRoots(workspaces, sessionCwds, stateDir)
 }
 
 /** The current task of a member: its first unfinished owned task. */
@@ -251,21 +444,29 @@ export async function collectTeamsActivity(
     try {
       entries = await readdir(root.stateRoot, { withFileTypes: true })
     } catch (error: unknown) {
-      if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
-        continue
+      // A live session cwd can be any directory the user opened, including one
+      // this process may not read (EACCES/ENOTDIR/EIO). One unreadable root
+      // must not blank every other team's panel.
+      if (!isMissingDirectory(error)) {
+        ctx.logger.warn(`agent-teams: skipped unreadable state root "${root.stateRoot}": ${String(error)}`)
       }
-      throw error
+      continue
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
+      const state = await readTeam(root.stateRoot, entry.name).catch((error: unknown) => {
+        ctx.logger.warn(`agent-teams: unreadable team state "${entry.name}" in workspace "${root.workspace}": ${String(error)}`)
+        return undefined
+      })
+      if (state === undefined) continue
       try {
-        const state = await readTeam(root.stateRoot, entry.name)
-        if (state === undefined) continue
         snapshots.push(await assembleTeamSnapshot(ctx, root.stateRoot, root.workspace, state, {
           ...root.workspacePath === undefined ? {} : { workspacePath: root.workspacePath },
         }))
-      } catch {
-        ctx.logger.warn(`agent-teams: skipped unreadable team state "${entry.name}" in workspace "${root.workspace}"`)
+      } catch (error: unknown) {
+        // A team that cannot be assembled is a broken team, not a broken root:
+        // name it, so it does not silently vanish from the panel.
+        ctx.logger.warn(`agent-teams: skipped team snapshot "${entry.name}" in workspace "${root.workspace}": ${String(error)}`)
       }
     }
   }
@@ -286,10 +487,23 @@ export async function collectArchivedTeamsActivity(
 ): Promise<TeamActivitySnapshot[]> {
   const snapshots: TeamActivitySnapshot[] = []
   for (const root of roots) {
-    for (const teamId of await listArchivedTeamIds(root.stateRoot)) {
+    let teamIds: string[]
+    try {
+      teamIds = await listArchivedTeamIds(root.stateRoot)
+    } catch (error: unknown) {
+      // Same rule as the live scan: one unreadable root must not hide the rest.
+      if (!isMissingDirectory(error)) {
+        ctx.logger.warn(`agent-teams: skipped unreadable archive root "${root.stateRoot}": ${String(error)}`)
+      }
+      continue
+    }
+    for (const teamId of teamIds) {
+      const state = await readArchivedTeam(root.stateRoot, teamId).catch((error: unknown) => {
+        ctx.logger.warn(`agent-teams: unreadable archived team "${teamId}" in workspace "${root.workspace}": ${String(error)}`)
+        return undefined
+      })
+      if (state === undefined) continue
       try {
-        const state = await readArchivedTeam(root.stateRoot, teamId)
-        if (state === undefined) continue
         snapshots.push(await assembleTeamSnapshot(
           ctx,
           join(root.stateRoot, 'archive'),
@@ -297,8 +511,8 @@ export async function collectArchivedTeamsActivity(
           state,
           { includeRemoved: true, historic: true },
         ))
-      } catch {
-        ctx.logger.warn(`agent-teams: skipped unreadable archived team "${teamId}" in workspace "${root.workspace}"`)
+      } catch (error: unknown) {
+        ctx.logger.warn(`agent-teams: skipped archived snapshot "${teamId}" in workspace "${root.workspace}": ${String(error)}`)
       }
     }
   }
